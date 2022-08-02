@@ -18,7 +18,7 @@ from qiskit import Aer
 from qiskit import QuantumCircuit
 from qiskit.circuit import Parameter 
 
-
+from qiskit.quantum_info import Statevector 
 from qiskit.algorithms.variational_algorithm import VariationalAlgorithm
 
 from qiskit.providers import Backend
@@ -69,6 +69,7 @@ def main(
     optimizer_config={"maxiter": 100},
     shots=8192,
     use_measurement_mitigation=False,
+    normalize_cost_function=True
 ):
 
     """
@@ -81,6 +82,7 @@ def main(
         matrix (np.ndarray): the matrix of the linear system.
         rhs (np.ndarray): the right habd side of the linear system.
         ansatz (QuantumCircuit): the quantum circuit of the ansatz.
+
         x0 (array_like): Optional, initial vector of parameters.
         optimizer (str): Optional, string specifying classical optimizer,
                          default='SPSA'.
@@ -91,15 +93,21 @@ def main(
                                            default=False.
 
     Returns:
-        OptimizeResult: The result in SciPy optimization format.
+        VariationalLinearSolverResult: The result of the optimization of the linear system
     """
 
     vqls = VQLS(ansatz=ansatz,
                 optimizer=optimizer,
                 quantum_instance=backend)
 
-    full_circs = vqls.construct_circuit(matrix, rhs, appply_explicit_measurement=True)
-    meas_strings = ['1'] * len(full_circs)
+    use_state_vector = is_statevector_backend(backend)
+    if use_state_vector:
+        print('Use exact statistic from state vector')
+        full_circs = vqls.construct_circuit(matrix, rhs, appply_explicit_measurement=False)
+    else:
+        print('Use count statistic')
+        full_circs = vqls.construct_circuit(matrix, rhs, appply_explicit_measurement=True)
+        meas_strings = ['1'] * len(full_circs)
 
     # Get the number of parameters in the ansatz circuit.
     num_params = vqls.ansatz.num_parameters
@@ -141,7 +149,8 @@ def main(
     # Here we convert to a list so that the return is user readable locally, but
     # this is not required.
     def callback(xk):
-        user_messenger.publish(list(xk))
+        if user_messenger is not None:
+            user_messenger.publish(list(xk))
 
     # This is the primary VQE function executed by the optimizer. This function takes the
     # parameter vector as input and returns the energy evaluated using an ansatz circuit
@@ -151,30 +160,34 @@ def main(
         # Attach (bind) parameters in params vector to the transpiled circuits.
         bound_circs = [circ.bind_parameters(params) for circ in trans_circs]
 
-        # Submit the job and get the resultant counts back
-        counts = backend.run(bound_circs, shots=shots).result().get_counts()
+        if use_state_vector:
+            state_vector = [Statevector(circ).data for circ in bound_circs]
+            probas = [ vqls.get_probability_from_statevector(sv) for sv in state_vector ]
 
-        # If using measurement mitigation apply the correction and
-        # compute expectation values from the resultant quasiprobabilities
-        # using the measurement strings.
-        if use_measurement_mitigation:
-            quasi_collection = mit.apply_correction(counts, maps)
-            expvals = quasi_collection.expval(meas_strings)
-        # If not doing any mitigation just compute expectation values
-        # from the raw counts using the measurement strings.
-        # Since Qiskit does not have such functionality we use the convenence
-        # function from the mthree mitigation module.
         else:
-            print(meas_strings)
-            print(counts)
-            expvals = mthree.utils.expval(counts, meas_strings)
 
-        # get the probas
-        probas = [vqls.get_probability_from_expected_value(e) for e in expvals]
+            # Submit the job and get the resultant counts back
+            counts = backend.run(bound_circs, shots=shots).result().get_counts()
+
+            # If using measurement mitigation apply the correction and
+            # compute expectation values from the resultant quasiprobabilities
+            # using the measurement strings.
+            if use_measurement_mitigation:
+                quasi_collection = mit.apply_correction(counts, maps)
+                expvals = quasi_collection.expval(meas_strings)
+            # If not doing any mitigation just compute expectation values
+            # from the raw counts using the measurement strings.
+            # Since Qiskit does not have such functionality we use the convenence
+            # function from the mthree mitigation module.
+            else:
+                expvals = mthree.utils.expval(counts, meas_strings)
+
+            # get the probas
+            probas = [vqls.get_probability_from_expected_value(e) for e in expvals]
 
         # The final cost is obatined via the vqls process_probability_circuit_output
         # method
-        cost = vqls.process_probability_circuit_output(probas)
+        cost = vqls.process_probability_circuit_output(probas, normalize_cost_function=normalize_cost_function)
         return cost
 
     # Here is where we actually perform the computation.  We begin by seeing what
@@ -189,15 +202,15 @@ def main(
 
     # Since SPSA is not in SciPy need if statement
     if optimizer == "SPSA":
-        res = fmin_spsa(vqls_func, x0, args=(), **optimizer_config, callback=callback)
+        opt_result = fmin_spsa(vqls_func, x0, args=(), **optimizer_config, callback=callback)
+
     # All other SciPy optimizers here
     else:
-        res = opt.minimize(
-            vqls_func, x0, method=optimizer, options=optimizer_config, callback=callback
+        opt_result = opt.minimize(
+            vqls_func, x0, method=optimizer, options=optimizer_config, tol=1E-3, callback=callback
         )
-    # Return result. OptimizeResult is a subclass of dict.
-    return res
 
+    return opt_result
 
 def fmin_spsa(
     func,
@@ -957,6 +970,17 @@ class VQLS(VariationalAlgorithm, VariationalLinearSolver):
         # compose the statefn of the observable on the circuit
         return ~StateFn(self.observable) @ StateFn(wave_function)
 
+    @staticmethod
+    def get_probability_from_statevector(statevector: List[complex]) -> float:
+        """transform the state array of the circuit to a proba
+
+        Args:
+            exp_val (complex): expected value of the observable
+        """
+        sv = statevector[1::2]
+        exp_val = np.real((sv*sv.conj()).sum())
+        return 1.0 - 2.0 * exp_val
+
 
     @staticmethod
     def get_probability_from_expected_value(exp_val: complex) -> float:
@@ -983,7 +1007,8 @@ class VQLS(VariationalAlgorithm, VariationalLinearSolver):
 
         return np.array(cii_coeffs), np.array(cij_coeffs) 
 
-    def process_probability_circuit_output(self, probabiliy_circuit_output: List) -> float:
+    def process_probability_circuit_output(self, probabiliy_circuit_output: List, 
+                                           normalize_cost_function: Optional[bool] = True) -> float:
         """Compute the final cost function from the output of the different circuits
 
         Args:
@@ -1003,7 +1028,11 @@ class VQLS(VariationalAlgorithm, VariationalLinearSolver):
         b_phi_overlap = self._compute_bphi_overlap(cii_coeffs, cij_coeffs, probabiliy_circuit_output)
 
         # overall cost
-        cost = 1.0 - np.real(b_phi_overlap/phi_phi_overlap)
+        if normalize_cost_function:
+            cost = 1.0 - np.real(b_phi_overlap/phi_phi_overlap)
+        else:
+            cost = np.real(phi_phi_overlap - b_phi_overlap)
+
         print('Cost function %f' %cost)
         return cost
 
